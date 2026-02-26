@@ -1,0 +1,70 @@
+trigger:
+  branches:
+    include: [ main ]
+
+pool:           # use your self-hosted pool
+  name: 'self-managed-ado-agent'
+
+variables:
+  tf_version: '1.6.6'
+  aws_region: 'eu-west-2'
+  tf_workdir: 'infra'
+
+stages:
+# --- PLAN (no approval) ---
+- stage: Plan
+  displayName: "Terraform Plan"
+  jobs:
+  - job: plan
+    displayName: "Plan on self-hosted agent"
+    pool: { name: ' self-managed-ado-agent }
+    steps:
+
+    - task: AWSCLI@1
+      displayName: "STS identity (sanity)"
+      inputs:
+        awsCredentials: 'aws-ado-oidc-sc'     # your AWS service connection (OIDC)
+        regionName: '$(aws_region)'
+        awsCommand: 'sts get-caller-identity'
+
+    - script: |
+        terraform -chdir=$(tf_workdir) init -upgrade
+        terraform -chdir=$(tf_workdir) validate
+        terraform -chdir=$(tf_workdir) plan \
+          -var="aws_region=$(aws_region)" \
+          -out=tfplan.out
+      displayName: "Terraform init/validate/plan"
+
+    # Publish plan file as artifact to pass to Apply stage
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish plan artifact"
+      inputs:
+        PathtoPublish: '$(tf_workdir)/tfplan.out'
+        ArtifactName: 'tfplan'
+        publishLocation: 'Container'
+
+# --- APPLY (requires manual approval via Environment) ---
+- stage: Apply
+  displayName: "Terraform Apply"
+  dependsOn: Plan
+  condition: succeeded()
+  # bind to an environment that has an Approval check
+  environment: 'prod'            # this triggers manual approval before this stage starts
+  jobs:
+  - job: apply
+    displayName: "Apply on self-hosted agent"
+    pool: { name: ' self-managed-ado-agent }
+    steps:
+    - download: current
+      artifact: tfplan
+
+    - task: AWSCLI@1
+      displayName: "STS identity (pre-apply)"
+      inputs:
+        awsCredentials: 'aws-ado-oidc-sc'
+        regionName: '$(aws_region)'
+        awsCommand: 'sts get-caller-identity'
+
+    - script: |
+        terraform -chdir=$(tf_workdir) apply -auto-approve tfplan.out
+      displayName: "Terraform apply"
